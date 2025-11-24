@@ -1,0 +1,153 @@
+# Ninety Srape 2 - Using Gemini API to extract structured data
+#Here I take output.csv and I use the Gemini API to create a neater dataframe with elements extracted
+#elements to extract
+    # Company Name, 
+    # Geography of the company, 
+    # Size of the company (revenue)
+    # Sector of the company within insurance (eg a tag of the sector)
+    # Painpoints of the company
+    # Solutions the company is looking for
+    # Summary of what Ninety already provides to the company (if any), any projects, what frameworks used 
+    # Any other information 
+
+import os
+import json
+import pandas as pd
+from google import genai
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL_ID = "gemini-2.5-flash"
+
+# ---------------------------------------------------------
+# 1. Search Google using Gemini (public info)
+# ---------------------------------------------------------
+def get_public_company_info(company_name: str) -> dict:
+    prompt = f"""
+Search public information about the company "{company_name}" using the Google Search functionality available to you.
+
+Return ONLY a JSON object with these keys:
+- size (check the revenue of the company from their financial statements of 2024 and return in USD)
+- geography
+- sector (what sector within insurance they operate in)
+
+Keep values short and factual and make sure they are standardised with the format
+If you cannot find info, respond "unknown".
+
+NO markdown, NO backticks.
+"""
+
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+    )
+
+    raw = response.text.strip()
+    raw = raw.replace("```json", "").replace("```", "")
+
+    try:
+        return json.loads(raw)
+    except:
+        return {
+            "size": "unknown",
+            "geography": "unknown",
+            "sector": "unknown"
+        }
+
+
+# 2. Extract internal insights from documents
+def extract_internal_insights(text: str) -> dict:
+
+    shortened = text[:20000]
+
+    prompt = f"""
+You are an analyst at Ninety. Analyze the internal text below.
+
+Return ONLY a valid JSON with EXACTLY these keys:
+- painpoints
+- desired_solutions
+- ninety_summary
+- other_information
+
+Rules:
+- Keep values short.
+- If unknown → "unknown".
+- NO markdown, NO backticks.
+
+Text:
+\"\"\"{shortened}\"\"\"
+"""
+
+    response = client.models.generate_content(
+        model=MODEL_ID,
+        contents=prompt,
+    )
+
+    raw = response.text.strip()
+    raw = raw.replace("```json", "").replace("```", "")
+
+    try:
+        return json.loads(raw)
+    except:
+        return {
+            "painpoints": "unknown",
+            "desired_solutions": "unknown",
+            "ninety_summary": "unknown",
+            "other_information": raw,
+        }
+
+
+# 3. MAIN PIPELINE
+def main():
+
+    print("Loading output.csv ...")
+    df = pd.read_csv("output.csv")
+
+    # STEP 1 — Combine all text per company
+    print("Combining documents per company...")
+    df["scraped_text"] = df["scraped_text"].fillna("").astype(str)
+
+    client_data = (
+        df.groupby("company_name")["scraped_text"]
+        .apply(lambda x: "\n\n".join(x))
+        .reset_index()
+        .rename(columns={"scraped_text": "all_text"})
+    )
+
+    client_data.to_csv("client_data.csv", index=False)
+    print("Created client_data.csv")
+
+    # STEP 2 — Enrich each company
+    results = []
+
+    for _, row in client_data.iterrows():
+        company = row["company_name"]
+        text = row["all_text"]
+
+        print(f"\nProcessing: {company}")
+
+        public = get_public_company_info(company)
+        internal = extract_internal_insights(text)
+
+        combined = {
+            "company_name": company,
+            "size": public["size"],
+            "geography": public["geography"],
+            "sector": public["sector"],
+            "painpoints": internal["painpoints"],
+            "desired_solutions": internal["desired_solutions"],
+            "ninety_summary": internal["ninety_summary"],
+            "other_information": internal["other_information"],
+        }
+
+        results.append(combined)
+
+    # STEP 3 — Save enriched dataset
+    final_df = pd.DataFrame(results)
+    final_df.to_csv("client_enriched.csv", index=False)
+    final_df.to_excel("client_enriched.xlsx", index=False)
+
+    print("\nDone! Saved client_enriched.csv and .xlsx")
+
+
+if __name__ == "__main__":
+    main()
