@@ -1,0 +1,161 @@
+import os
+import re
+import pandas as pd
+from openai import OpenAI
+from typing import List
+
+
+# CONFIGURATION
+CSV_PATH = "news_snapshot.csv"
+MODEL = "gpt-4.1-mini"
+TOP_K_ARTICLES = 18
+MAX_CHARS_PER_ARTICLE = 1200
+TEMPERATURE = 0.2
+
+REQUIRED_COLUMNS = {
+    "site",
+    "published_date",
+    "title",
+    "url",
+    "summary",
+    "extracted_text",
+}
+
+
+# LOAD CSV
+def load_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CSV not found: {path}")
+
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}")
+
+    # Ensure strings
+    for c in REQUIRED_COLUMNS:
+        df[c] = df[c].fillna("").astype(str)
+
+    # Newest first
+    df = df.sort_values("published_date", ascending=False)
+
+    return df
+
+
+# BASIC RETRIEVAL (keyword scoring)
+def tokenize(text: str) -> List[str]:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return [t for t in text.split() if len(t) > 2]
+
+
+def score_row(query_tokens: List[str], text: str) -> float:
+    text = text.lower()
+    score = 0
+    for t in query_tokens:
+        if t in text:
+            score += 1
+    return score
+
+
+def select_relevant_articles(df: pd.DataFrame, question: str, k: int) -> pd.DataFrame:
+    tokens = tokenize(question)
+
+    scores = []
+    for _, r in df.iterrows():
+        combined = f"{r['title']} {r['summary']} {r['extracted_text']}"
+        scores.append(score_row(tokens, combined))
+
+    df = df.copy()
+    df["score"] = scores
+    df = df[df["score"] > 0]
+
+    if df.empty:
+        return df.head(k)
+
+    return df.sort_values(["score", "published_date"], ascending=[False, False]).head(k)
+
+
+# PROMPT BUILDER
+def format_article(row) -> str:
+    text = (row["summary"] + "\n" + row["extracted_text"]).strip()
+    text = re.sub(r"\s+", " ", text)[:MAX_CHARS_PER_ARTICLE]
+
+    return f"""
+TITLE: {row['title']}
+SITE: {row['site']}
+DATE: {row['published_date']}
+URL: {row['url']}
+CONTENT: {text}
+""".strip()
+
+
+def build_prompt(rows: pd.DataFrame, question: str) -> str:
+    articles = "\n\n---\n\n".join(
+        format_article(r) for _, r in rows.iterrows()
+    )
+
+    return f"""
+Context:
+You are an insurance innovation analyst reviewing recent insurtech and insurance-industry news articles.
+
+Rules:
+- Use ONLY the articles provided below.
+- Do NOT use outside knowledge.
+- Cite each factual claim as (Site, Date, Title).
+- If the information is not present, say so explicitly.
+
+Task:
+Answer the following question using the articles.
+
+Question:
+{question}
+
+Articles:
+{articles}
+""".strip()
+
+
+# OPENAI CALL
+def ask_openai(prompt: str) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    client = OpenAI()
+    response = client.responses.create(
+        model=MODEL,
+        input=prompt,
+        temperature=TEMPERATURE,
+    )
+    return response.output_text.strip()
+
+
+# MAIN
+def main():
+    question = input("\nEnter your question:\n> ").strip()
+    if not question:
+        return
+
+    df = load_csv(CSV_PATH)
+    relevant = select_relevant_articles(df, question, TOP_K_ARTICLES)
+
+    if relevant.empty:
+        print("\nNo relevant articles found.\n")
+        return
+
+    prompt = build_prompt(relevant, question)
+    answer = ask_openai(prompt)
+
+    print("\n=== ANSWER ===\n")
+    print(answer)
+
+    print("\n=== SOURCES USED ===\n")
+    for _, r in relevant.iterrows():
+        print(f"- {r['site']} | {r['published_date']} | {r['title']}")
+
+
+
+if __name__ == "__main__":
+    main()

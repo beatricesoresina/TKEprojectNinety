@@ -1,0 +1,16 @@
+# News Scraper Tool (InsurTech & Insurance)
+
+This tool scrapes the latest insurance and insurtech news articles, summarizes them using Gemini AI, and exports the results to Excel.
+
+## Requirements
+- Python 3.11 or newer
+- Internet connection
+
+## Setup (first time only)
+
+### macOS / Linux
+```bash
+cd "4. News Tool"
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt

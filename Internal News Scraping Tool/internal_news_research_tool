@@ -1,0 +1,587 @@
+import os
+import re
+import json
+import time
+import sqlite3
+import random
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
+
+import requests
+import pandas as pd
+import dateparser
+from bs4 import BeautifulSoup
+from readability import Document
+from tqdm import tqdm
+
+from openai import OpenAI
+
+
+# OpenAI Configuration
+# Set your key in terminal:
+#   export OPENAI_API_KEY="sk-..."
+# The OpenAI SDK will read OPENAI_API_KEY automatically from env. :contentReference[oaicite:4]{index=4}
+
+OPENAI_MODEL_ID = "gpt-4.1-mini"  # good quality/cost; you can change later
+OPENAI_MAX_RETRIES = 8
+OPENAI_INITIAL_BACKOFF_S = 1.5
+OPENAI_MAX_BACKOFF_S = 25.0
+
+
+# Scraper Config
+SITES = [
+    {"name": "Coverager", "list_url": "https://coverager.com", "allowed_domains": {"coverager.com"}},
+    {"name": "InsurTechDigital", "list_url": "https://insurtechdigital.com/news", "allowed_domains": {"insurtechdigital.com"}},
+    {"name": "InsurtechInsights", "list_url": "https://www.insurtechinsights.com/news-insights/all-news/", "allowed_domains": {"www.insurtechinsights.com", "insurtechinsights.com"}},
+    {"name": "InsuranceInnovationReporter", "list_url": "https://iireporter.com/category/news/", "allowed_domains": {"iireporter.com"}},
+    {"name": "InsuranceJournal", "list_url": "https://www.insurancejournal.com/mostpopular/", "allowed_domains": {"www.insurancejournal.com", "insurancejournal.com"}},
+    {"name": "InsuranceBusinessMag", "list_url": "https://www.insurancebusinessmag.com/us/news/breaking-news/", "allowed_domains": {"www.insurancebusinessmag.com", "insurancebusinessmag.com"}},
+    {"name": "InsuranceInsider", "list_url": "https://www.insuranceinsider.com/topics/industry-topics/insurtech", "allowed_domains": {"www.insuranceinsider.com", "insuranceinsider.com"}},
+]
+
+DB_PATH = "news.db"
+MAX_LISTING_PAGES = 2
+MAX_NEW_PER_SITE = 40
+REQUEST_TIMEOUT = 25
+SLEEP_BETWEEN_REQUESTS = 0.4
+
+
+# HTTP helpers
+def make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s
+
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    url = url.split("#", 1)[0]
+    return url
+
+
+def domain_ok(url: str, allowed_domains: set) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        return any(netloc == d or netloc.endswith("." + d) for d in allowed_domains)
+    except Exception:
+        return False
+
+
+def fetch_html(session: requests.Session, url: str) -> Optional[str]:
+    """Separate connect/read timeout, retry once."""
+    for _ in range(2):
+        try:
+            r = session.get(url, timeout=(10, REQUEST_TIMEOUT))
+            if r.status_code >= 400:
+                return None
+            return r.text
+        except requests.RequestException:
+            time.sleep(1)
+    return None
+
+
+def soupify(html: str) -> BeautifulSoup:
+    return BeautifulSoup(html, "lxml")
+
+
+# Article parsing helpers
+def guess_date_from_text(text: str) -> Optional[str]:
+    dt = dateparser.parse(
+        text,
+        settings={"RETURN_AS_TIMEZONE_AWARE": False, "PREFER_DATES_FROM": "past"},
+    )
+    if not dt:
+        return None
+    return dt.strftime("%Y-%m-%d")
+
+
+def extract_meta(soup: BeautifulSoup) -> Dict[str, str]:
+    def get_meta(*names: str) -> Optional[str]:
+        for n in names:
+            tag = soup.find("meta", attrs={"property": n}) or soup.find("meta", attrs={"name": n})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return None
+
+    title = get_meta("og:title", "twitter:title") or (
+        soup.title.string.strip() if soup.title and soup.title.string else ""
+    )
+    published = get_meta(
+        "article:published_time", "og:article:published_time", "pubdate", "publish-date", "date"
+    ) or ""
+
+    published_date = ""
+    if published:
+        dt = dateparser.parse(published)
+        if dt:
+            published_date = dt.strftime("%Y-%m-%d")
+
+    return {"title": title, "published_date": published_date}
+
+
+def extract_article_text(html: str) -> str:
+    doc = Document(html)
+    content_html = doc.summary(html_partial=True)
+    s = soupify(content_html)
+
+    for t in s(["script", "style", "noscript"]):
+        t.decompose()
+
+    text = s.get_text("\n", strip=True)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # fallback if readability returns too little (paywall / thin pages)
+    if len(text) < 400:
+        full = soupify(html).get_text("\n", strip=True)
+        full = re.sub(r"\n{3,}", "\n\n", full).strip()
+        if len(full) > len(text):
+            text = full
+
+    return text
+
+
+def extract_type_hint(site_name: str, soup: BeautifulSoup) -> str:
+    crumbs = " ".join(
+        [c.get_text(" ", strip=True) for c in soup.select("nav a, .breadcrumb a, .breadcrumbs a")]
+    ).lower()
+
+    if "opinion" in crumbs:
+        return "Opinion"
+    if "analysis" in crumbs:
+        return "Analysis"
+    if "feature" in crumbs:
+        return "Feature"
+    if site_name in {"InsuranceBusinessMag", "InsuranceJournal"}:
+        return "News"
+    return "Unknown"
+
+
+# -----------------------------
+# SQLite persistence
+# -----------------------------
+def init_db(db_path: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS articles (
+                url TEXT PRIMARY KEY,
+                site TEXT,
+                title TEXT,
+                published_date TEXT,
+                type_of_article TEXT,
+                summary TEXT,
+                extracted_text TEXT,
+                created_at_utc TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.commit()
+
+
+def already_have_urls(db_path: str) -> set:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT url FROM articles").fetchall()
+    return {r[0] for r in rows}
+
+
+def upsert_articles(db_path: str, rows: List[Dict]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO articles
+            (url, site, title, published_date, type_of_article, summary, extracted_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["url"],
+                    r["site"],
+                    r.get("title", ""),
+                    r.get("published_date", ""),
+                    r.get("type_of_article", ""),
+                    r.get("summary", ""),
+                    r.get("extracted_text", ""),
+                )
+                for r in rows
+            ],
+        )
+        conn.commit()
+
+
+def load_all_articles(db_path: str) -> pd.DataFrame:
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM articles ORDER BY published_date DESC, created_at_utc DESC",
+            conn,
+        )
+    return df
+
+
+# -----------------------------
+# Listing discovery (site-specific + fallback)
+# -----------------------------
+def discover_article_links(session: requests.Session, site: Dict) -> List[str]:
+    """
+    Site-aware discovery.
+    - Coverager: pull only from main 'Latest Articles' container (div.w-full xl:w-2/3 xl:px-3)
+    - InsuranceBusinessMag: pull from known containers and enforce /us/news/ + .aspx
+    - InsuranceInnovationReporter (iireporter): pull from #content article h1.entry-title a
+    - InsuranceInsider: pull from ps-list-loadmore.ListLoadMore
+    - Generic fallback: scan all <a href> and apply heuristics
+    """
+    found: List[str] = []
+    visited_pages = set()
+    to_visit = [site["list_url"]]
+
+    for _ in range(MAX_LISTING_PAGES):
+        if not to_visit:
+            break
+
+        page_url = to_visit.pop(0)
+        if page_url in visited_pages:
+            continue
+        visited_pages.add(page_url)
+
+        html = fetch_html(session, page_url)
+        if not html:
+            continue
+        soup = soupify(html)
+
+        # ----------------------------------------------------
+        # SPECIAL CASE 0: Coverager (coverager.com)
+        # ----------------------------------------------------
+        if site["name"] == "Coverager":
+            main = soup.select_one("div.w-full.xl\\:w-2\\/3.xl\\:px-3")
+            if main:
+                # The main article links are anchors with this class.
+                for a in main.select("a.text-black.hover\\:text-grey-darker[href]"):
+                    href = (a.get("href") or "").strip()
+                    if not href:
+                        continue
+
+                    abs_url = normalize_url(urljoin(page_url, href))
+                    low = abs_url.lower()
+
+                    # Filter out category pages etc.
+                    if any(x in low for x in ["/category/", "/tag/", "/author/", "/page/"]):
+                        continue
+
+                    # Coverager posts are usually root-level slugs ending with /
+                    # Keep only same-domain links
+                    if domain_ok(abs_url, site["allowed_domains"]):
+                        found.append(abs_url)
+
+                # Pagination: Coverager uses .pagination-container and "next page-numbers"
+                nxt = soup.select_one("div.pagination-container a.next.page-numbers[href]")
+                if nxt and nxt.get("href"):
+                    next_url = normalize_url(urljoin(page_url, nxt["href"]))
+                    if domain_ok(next_url, site["allowed_domains"]):
+                        to_visit.append(next_url)
+
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            continue
+
+        # SPECIAL CASE 1: InsuranceBusinessMag (Key Media)
+        if site["name"] == "InsuranceBusinessMag":
+            containers = soup.select("div.article-list--content, div.top-down-list")
+            for c in containers:
+                for a in c.select("a[href]"):
+                    href = (a.get("href") or "").strip()
+                    if not href:
+                        continue
+
+                    abs_url = normalize_url(urljoin(page_url, href))
+                    low = abs_url.lower()
+
+                    # Only accept news articles
+                    if "/us/news/" not in low:
+                        continue
+                    if not low.endswith(".aspx"):
+                        continue
+
+                    # Exclude non-news sections
+                    if any(x in low for x in ["/us/tv/", "/us/ib-talk/", "/images/", "/tag/", "/category/"]):
+                        continue
+
+                    if domain_ok(abs_url, site["allowed_domains"]):
+                        found.append(abs_url)
+
+            # Pagination (sometimes present, sometimes not)
+            next_link = soup.select_one("a.next, a[rel='next'], a.pagination__next, a[aria-label='Next']")
+            if next_link and next_link.get("href"):
+                nxt = normalize_url(urljoin(page_url, next_link["href"]))
+                if domain_ok(nxt, site["allowed_domains"]):
+                    to_visit.append(nxt)
+
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            continue
+
+        # SPECIAL CASE 2: InsuranceInnovationReporter (iireporter.com)
+        if site["name"] == "InsuranceInnovationReporter":
+            # Be tolerant: sometimes class/role attributes vary, but #content is stable.
+            content = soup.select_one("div#content") or soup.select_one("div#content.site-content") \
+                      or soup.select_one("div.site-content[role='main']")
+
+            if content:
+                for a in content.select("article h1.entry-title a[href]"):
+                    href = (a.get("href") or "").strip()
+                    if not href:
+                        continue
+                    abs_url = normalize_url(urljoin(page_url, href))
+                    if domain_ok(abs_url, site["allowed_domains"]):
+                        found.append(abs_url)
+
+                # Pagination: "Older posts" is .nav-previous a
+                older = content.select_one("nav.paging-navigation .nav-previous a[href]")
+                if older and older.get("href"):
+                    nxt = normalize_url(urljoin(page_url, older["href"]))
+                    if domain_ok(nxt, site["allowed_domains"]):
+                        to_visit.append(nxt)
+
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            continue
+
+        # SPECIAL CASE 3: InsuranceInsider (insuranceinsider.com)
+        if site["name"] == "InsuranceInsider":
+            container = soup.select_one("ps-list-loadmore.ListLoadMore") or soup.select_one("ps-list-loadmore[data-list-loadmore]")
+            if container:
+                # Grab article/podcast-article links shown in the list
+                for a in container.select("ul.ListLoadMore-items a[href]"):
+                    href = (a.get("href") or "").strip()
+                    if not href:
+                        continue
+
+                    abs_url = normalize_url(urljoin(page_url, href))
+                    low = abs_url.lower()
+
+                    is_article = "/article/" in low
+                    is_podcast_article = "/podcasts/article/" in low
+                    if not (is_article or is_podcast_article):
+                        continue
+
+                    if domain_ok(abs_url, site["allowed_domains"]):
+                        found.append(abs_url)
+
+                # Pagination: "Load more"
+                next_a = container.select_one("div.ListLoadMore-nextPage a[href]")
+                if next_a and next_a.get("href"):
+                    nxt = normalize_url(urljoin(page_url, next_a["href"]))
+                    if domain_ok(nxt, site["allowed_domains"]):
+                        to_visit.append(nxt)
+
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+            continue
+
+        # GENERIC FALLBACK: other sites
+        for a in soup.select("a[href]"):
+            href = (a.get("href") or "").strip()
+            if not href:
+                continue
+
+            abs_url = normalize_url(urljoin(page_url, href))
+            if not domain_ok(abs_url, site["allowed_domains"]):
+                continue
+
+            low = abs_url.lower()
+
+            if any(x in low for x in [
+                "/tag/", "/category/", "/author/", "/events", "/about", "/contact", "/privacy",
+                "/subscribe", "/login", "/sign-in", "/account"
+            ]):
+                continue
+
+            looks_article = (
+                re.search(r"/\d{4}/\d{2}/\d{2}/", abs_url)
+                or re.search(r"/\d{4}/\d{2}/", abs_url)
+                or low.endswith(".aspx")
+                or "/news/" in low
+                or "/article/" in low
+                or "breaking-news" in low
+                or "mostpopular" in site["list_url"].lower()
+            )
+            if looks_article:
+                found.append(abs_url)
+
+        next_link = soup.select_one("a.next, a[rel='next']")
+        if next_link and next_link.get("href"):
+            nxt = normalize_url(urljoin(page_url, next_link["href"]))
+            if domain_ok(nxt, site["allowed_domains"]):
+                to_visit.append(nxt)
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    # de-dupe preserve order
+    seen = set()
+    out = []
+    for u in found:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+# OpenAI summarization + typing
+def make_openai_client() -> Optional[OpenAI]:
+    # If missing key, return None so script can still scrape.
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    return OpenAI()
+
+
+def _is_retryable_openai_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return (
+        "429" in s
+        or "rate limit" in s
+        or "timeout" in s
+        or "temporarily unavailable" in s
+        or "503" in s
+        or "502" in s
+        or "500" in s
+    )
+
+
+def openai_generate_text_with_retry(client: OpenAI, prompt: str) -> str:
+    backoff = OPENAI_INITIAL_BACKOFF_S
+
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            # Responses API (recommended for new projects) :contentReference[oaicite:5]{index=5}
+            resp = client.responses.create(
+                model=OPENAI_MODEL_ID,
+                input=prompt,
+            )
+            return (resp.output_text or "").strip()
+
+        except Exception as e:
+            if _is_retryable_openai_error(e):
+                # Exponential backoff + jitter (recommended approach for rate limits) :contentReference[oaicite:6]{index=6}
+                sleep_s = min(backoff, OPENAI_MAX_BACKOFF_S) + random.uniform(0, 0.8)
+                print(f"[OpenAI] retryable error (attempt {attempt+1}/{OPENAI_MAX_RETRIES}). Sleeping {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+                backoff *= 1.8
+                continue
+
+            print(f"[OpenAI] non-retryable error: {e}")
+            return ""
+
+    return ""
+
+
+def openai_summarize_and_type(client: OpenAI, title: str, text: str) -> Tuple[str, str]:
+    prompt = f"""
+You are categorizing and summarizing insurance/insurtech news articles.
+
+Return ONLY valid JSON with keys:
+- "summary": 3-5 bullet points (as a single string, bullets starting with "- ")
+- "type_of_article": one of ["News","Analysis","Opinion","Feature","Interview","Press Release","Sponsored","Other"]
+
+Title: {title}
+
+Article text:
+{text[:12000]}
+""".strip()
+
+    raw = openai_generate_text_with_retry(client, prompt)
+    if not raw:
+        return "- Summary unavailable (OpenAI call failed).", "Other"
+
+    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+    try:
+        obj = json.loads(raw)
+        summary = (obj.get("summary") or "").strip()
+        typ = (obj.get("type_of_article") or "Other").strip()
+        allowed = {"News","Analysis","Opinion","Feature","Interview","Press Release","Sponsored","Other"}
+        if typ not in allowed:
+            typ = "Other"
+        return summary, typ
+    except Exception:
+        return raw[:1500], "Other"
+
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def scrape_new_articles() -> pd.DataFrame:
+    init_db(DB_PATH)
+    existing = already_have_urls(DB_PATH)
+
+    openai_client = make_openai_client()
+    session = make_session()
+    new_rows: List[Dict] = []
+
+    if openai_client is None:
+        print("WARNING: OPENAI_API_KEY not set. Will scrape and store articles with summary/type = PENDING.")
+
+    for site in SITES:
+        print(f"\n==> {site['name']} | discovering links from {site['list_url']}")
+        links = discover_article_links(session, site)
+
+        fresh = [u for u in links if u not in existing][:MAX_NEW_PER_SITE]
+        print(f"Found {len(links)} candidates, {len(fresh)} new")
+
+        for url in tqdm(fresh, desc=f"Scraping {site['name']}", unit="article"):
+            html = fetch_html(session, url)
+            if not html:
+                continue
+            soup = soupify(html)
+
+            meta = extract_meta(soup)
+            title = meta["title"] or ""
+            published_date = meta["published_date"]
+
+            if not published_date:
+                time_tag = soup.find("time")
+                if time_tag:
+                    published_date = guess_date_from_text(time_tag.get_text(" ", strip=True)) or ""
+                if not published_date:
+                    snippet = soup.get_text(" ", strip=True)[:600]
+                    published_date = guess_date_from_text(snippet) or ""
+
+            extracted_text = extract_article_text(html)
+            type_hint = extract_type_hint(site["name"], soup)
+
+            if openai_client is None:
+                summary, type_of_article = "PENDING", "PENDING"
+            else:
+                summary, type_of_article = openai_summarize_and_type(openai_client, title, extracted_text)
+
+                if type_of_article == "Other" and type_hint != "Unknown":
+                    type_of_article = type_hint
+
+            row = {
+                "url": url,
+                "site": site["name"],
+                "title": title,
+                "published_date": published_date,
+                "type_of_article": type_of_article,
+                "summary": summary,
+                "extracted_text": extracted_text,
+            }
+            new_rows.append(row)
+            existing.add(url)
+
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    if new_rows:
+        upsert_articles(DB_PATH, new_rows)
+
+    df = load_all_articles(DB_PATH)
+    df.to_csv("news_snapshot.csv", index=False)
+    return df
+
+
+if __name__ == "__main__":
+    df = scrape_new_articles()
+    print("\nDone.")
+    print(df[["site", "published_date", "title", "type_of_article", "url"]].head(20))
+    print("\nSaved:")
+    print("- SQLite DB:", DB_PATH)
+    print("- CSV snapshot: news_snapshot.csv")
